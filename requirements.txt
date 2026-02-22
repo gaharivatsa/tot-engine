@@ -1,0 +1,11 @@
+# Core dependencies
+fastmcp>=0.4.0
+pydantic>=2.0.0
+
+# Optional but recommended
+sqlite3-python>=0.0.1
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# mypy>=1.0.0
