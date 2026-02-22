@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-Tree of Thought Engine - Unified MCP Server
+Tree of Thought Engine v2.0 - Unified MCP Server
 
-Production-grade MCP server providing both standard and enforced Tree of Thought reasoning.
-
-Features:
-- Standard mode: Flexible exploration with full control
-- Enforced mode: Guaranteed depth with parameter validation
-- Both modes accessible through unified API
-- Production-ready with comprehensive error handling
+Production-grade MCP server with unified API for both regular and enforced modes.
 
 Usage:
-    # Standard mode
-    mcporter call tot-engine.tot_start_run task_prompt="..."
+    # Regular mode (flexible)
+    mcporter call tot-engine.tot_start_run 
+        mode="regular"
+        task_prompt="Which database?"
+        beam_width=3
+        node_budget=50
     
-    # Enforced mode  
-    mcporter call tot-engine.tot_start_run_enforced 
-        task_prompt="..."
+    # Enforced mode (guaranteed depth)
+    mcporter call tot-engine.tot_start_run
+        mode="enforced"
+        task_prompt="Design architecture"
         exploration_level="deep"
+        
+    # Enforced with overrides
+    mcporter call tot-engine.tot_start_run
+        mode="enforced"
+        task_prompt="..."
+        exploration_level="moderate"
+        custom_beam_width=5  # Override preset
 """
 
 import os
@@ -26,107 +32,50 @@ import json
 import sqlite3
 import uuid
 import hashlib
-import time
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
-from dataclasses import dataclass
 from enum import Enum
 
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-# Import enforcement components
-from .enforcement import (
-    EnforcementEngine, 
+# Import enforcement and config modules
+from enforcement import (
     EnforcementConfig,
-    ExplorationLevel,
     ENFORCEMENT_CONFIGS,
     get_enforcement_config,
-    calculate_score
+    calculate_score,
 )
-from .config import (
-    get_exploration_config,
-    get_depth_guideline,
-    get_candidate_strategies,
-    DEPTH_CONFIGS
-)
+from config import get_depth_guideline, DEPTH_CONFIGS
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
 DB_PATH = os.environ.get("TOT_DB_PATH", "/tmp/tot_engine.db")
-DEFAULT_BEAM_WIDTH = 3
-DEFAULT_N_GENERATE = 2
-DEFAULT_MAX_DEPTH = 5
-DEFAULT_NODE_BUDGET = 20
-DEFAULT_TARGET_SCORE = 0.85
+
+# Default parameters for regular mode
+DEFAULTS = {
+    "beam_width": 3,
+    "n_generate": 2,
+    "max_depth": 5,
+    "node_budget": 20,
+    "target_score": 0.85,
+}
 
 # ============================================================================
-# Pydantic Schemas
-# ============================================================================
-
-class State(BaseModel):
-    """Evolving world state"""
-    facts: List[str] = Field(default_factory=list, min_length=1)
-    assumptions: List[str] = Field(default_factory=list)
-    work: Dict[str, Any] = Field(default_factory=dict)
-    constraints: List[str] = Field(default_factory=list)
-
-class ThoughtCandidate(BaseModel):
-    """Single candidate thought from client"""
-    thought: str = Field(min_length=3, description="The reasoning step")
-    delta: Dict[str, Any] = Field(default_factory=dict, description="What changed from parent")
-    progress_estimate: float = Field(ge=0.0, le=1.0, description="Progress toward goal (0-1)")
-    feasibility_estimate: float = Field(ge=0.0, le=1.0, description="Implementation feasibility (0-1)")
-    risk_estimate: float = Field(ge=0.0, le=1.0, description="Risk level (0-1, higher=riskier)")
-    reasoning: str = Field(min_length=3, description="Explanation for estimates")
-
-class SearchConfig(BaseModel):
-    """Search configuration"""
-    beam_width: int = Field(default=3, ge=1, le=10)
-    n_generate: int = Field(default=2, ge=1, le=5)
-    max_depth: int = Field(default=5, ge=1, le=20)
-    node_budget: int = Field(default=20, ge=2, le=1000)
-    target_score: float = Field(default=0.85, ge=0.0, le=1.0)
-    exploration_level: Optional[str] = Field(default=None, description="enforced mode level")
-
-class StartRunRequest(BaseModel):
-    """Request to start a ToT run"""
-    task_prompt: str = Field(min_length=5, description="The problem to solve")
-    constraints: List[str] = Field(default_factory=list)
-    beam_width: int = Field(default=3, ge=1, le=10)
-    n_generate: int = Field(default=2, ge=1, le=5)
-    max_depth: int = Field(default=5, ge=1, le=20)
-    node_budget: int = Field(default=20, ge=2, le=1000)
-    target_score: float = Field(default=0.85, ge=0.0, le=1.0)
-
-class StartEnforcedRunRequest(BaseModel):
-    """Request to start an ENFORCED ToT run"""
-    task_prompt: str = Field(min_length=5, description="The problem to solve")
-    exploration_level: str = Field(
-        default="moderate",
-        pattern="^(shallow|moderate|deep|exhaustive)$",
-        description="Enforcement level: shallow/moderate/deep/exhaustive"
-    )
-    constraints: List[str] = Field(default_factory=list)
-    custom_budget: Optional[int] = Field(default=None, ge=10, le=2000)
-    custom_target: Optional[float] = Field(default=None, ge=0.5, le=1.0)
-
-# ============================================================================
-# Database
+# Database Setup
 # ============================================================================
 
 class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
-        self.init_db()
+        self._init_db()
     
-    def init_db(self):
+    def _init_db(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Runs table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -137,12 +86,11 @@ class Database:
                 created_at TEXT NOT NULL,
                 completed_at TEXT,
                 best_node_id TEXT,
-                is_enforced BOOLEAN DEFAULT 0,
-                enforcement_level TEXT
+                mode TEXT DEFAULT 'regular',
+                exploration_level TEXT
             )
         """)
         
-        # Nodes table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
@@ -157,8 +105,7 @@ class Database:
                 status TEXT DEFAULT 'active',
                 state_hash TEXT,
                 thought_hash TEXT,
-                FOREIGN KEY (run_id) REFERENCES runs(run_id),
-                FOREIGN KEY (parent_id) REFERENCES nodes(node_id)
+                FOREIGN KEY (run_id) REFERENCES runs(run_id)
             )
         """)
         
@@ -170,348 +117,266 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
-# Initialize database
 db = Database()
 
 # ============================================================================
 # MCP Server
 # ============================================================================
 
-mcp = FastMCP("tot-engine-unified")
+mcp = FastMCP("tot-engine-v2")
+
+class ThoughtCandidate(BaseModel):
+    """Single candidate thought"""
+    thought: str = Field(min_length=3)
+    delta: Dict[str, Any] = Field(default_factory=dict)
+    progress_estimate: float = Field(ge=0.0, le=1.0)
+    feasibility_estimate: float = Field(ge=0.0, le=1.0)
+    risk_estimate: float = Field(ge=0.0, le=1.0)
+    reasoning: str = Field(min_length=3)
+
 
 @mcp.tool()
 def tot_start_run(
-    task_prompt: str,
-    constraints: List[str] = Field(default_factory=list),
-    beam_width: int = Field(default=3, ge=1, le=10),
-    n_generate: int = Field(default=2, ge=1, le=5),
-    max_depth: int = Field(default=5, ge=1, le=20),
-    node_budget: int = Field(default=20, ge=2, le=1000),
-    target_score: float = Field(default=0.85, ge=0.0, le=1.0)
+    task_prompt: str = Field(..., min_length=5, description="The problem to solve"),
+    mode: str = Field(default="regular", pattern="^(regular|enforced)$", description="Mode: regular (flexible) or enforced (guaranteed depth)"),
+    constraints: List[str] = Field(default_factory=list, description="Hard constraints"),
+    # Regular mode params (used when mode="regular" or as overrides)
+    beam_width: Optional[int] = Field(default=None, ge=1, le=10, description="Nodes to keep per iteration"),
+    n_generate: Optional[int] = Field(default=None, ge=1, le=5, description="Children per node"),
+    max_depth: Optional[int] = Field(default=None, ge=1, le=20, description="Max tree depth"),
+    node_budget: Optional[int] = Field(default=None, ge=2, le=1000, description="Total node budget"),
+    target_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Terminal threshold"),
+    # Enforced mode params (used when mode="enforced")
+    exploration_level: Optional[str] = Field(default=None, pattern="^(shallow|moderate|deep|exhaustive)$", description="Enforcement preset"),
+    # Override flags for enforced mode
+    custom_beam_width: Optional[int] = Field(default=None, ge=1, le=10, description="Override beam_width in enforced mode"),
+    custom_target_score: Optional[float] = Field(default=None, ge=0.5, le=1.0, description="Override target_score in enforced mode"),
 ) -> Dict:
     """
-    STANDARD MODE: Start a flexible Tree of Thought run.
+    UNIFIED: Start a Tree of Thought run (regular or enforced mode).
     
-    Use this for exploratory research where you want full control over
-    the exploration process. No minimum budget enforcement.
+    Use 'mode' parameter to select behavior:
+    - "regular": Full control over all parameters
+    - "enforced": Use exploration_level preset, with optional overrides
     
-    Args:
-        task_prompt: The problem or question to solve
-        constraints: List of hard constraints (e.g., ["budget < 1000", " Pi 4 compatible"])
-        beam_width: How many top nodes to keep per iteration (1-10)
-        n_generate: How many children to generate per node (1-5)
-        max_depth: Maximum tree depth (1-20)
-        node_budget: Total nodes allowed including root (2-1000)
-        target_score: Score threshold to mark node as terminal (0.0-1.0)
-    
-    Returns:
-        Dictionary with run_id and configuration details
-    
-    Example:
-        mcporter call tot-engine.tot_start_run 
-            task_prompt="Which database for edge deployment?"
-            constraints=["Pi 4 compatible", "Self-hosted"]
-            beam_width=3
-            n_generate=3
-            node_budget=50
+    Examples:
+        # Regular mode
+        tot_start_run(mode="regular", task_prompt="...", beam_width=3)
+        
+        # Enforced mode (preset)
+        tot_start_run(mode="enforced", task_prompt="...", exploration_level="deep")
+        
+        # Enforced with override
+        tot_start_run(mode="enforced", exploration_level="moderate", custom_beam_width=5)
     """
-    conn = db.get_connection()
-    cursor = conn.cursor()
     
-    run_id = str(uuid.uuid4())
-    config = SearchConfig(
-        beam_width=beam_width,
-        n_generate=n_generate,
-        max_depth=max_depth,
-        node_budget=node_budget,
-        target_score=target_score
-    )
-    
-    # Insert run
-    cursor.execute(
-        """INSERT INTO runs 
-           (run_id, task_prompt, constraints_json, search_config_json, status, created_at, is_enforced)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (run_id, task_prompt, json.dumps(constraints), config.json(), 
-         'active', datetime.now().isoformat(), False)
-    )
-    
-    # Create root node
-    root_id = str(uuid.uuid4())
-    cursor.execute(
-        """INSERT INTO nodes 
-           (node_id, run_id, parent_id, depth, thought, state_json, delta_json,
-            evaluation_json, score, status, state_hash, thought_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (root_id, run_id, None, 0, f"ROOT: {task_prompt[:100]}",
-         json.dumps({"constraints": constraints}),
-         json.dumps({}), json.dumps({"progress": 0.5, "feasibility": 0.5, "confidence": 0.5}),
-         0.5, 'active', 'root', hashlib.sha256(task_prompt.lower().encode()).hexdigest()[:16])
-    )
-    
-    conn.commit()
-    conn.close()
-    
-    return {
-        "success": True,
-        "run_id": run_id,
-        "root_node_id": root_id,
-        "mode": "standard",
-        "config": config.dict(),
-        "message": "Run started. Call tot_request_samples() to begin expansion."
-    }
-
-@mcp.tool()
-def tot_start_run_enforced(
-    task_prompt: str,
-    exploration_level: str = Field(default="moderate", pattern="^(shallow|moderate|deep|exhaustive)$"),
-    constraints: List[str] = Field(default_factory=list),
-    custom_budget: Optional[int] = Field(default=None, ge=10, le=2000),
-    custom_target: Optional[float] = Field(default=None, ge=0.5, le=1.0)
-) -> Dict:
-    """
-    ENFORCED MODE: Start a Tree of Thought run with guaranteed exploration depth.
-    
-    Use this when you need rigorous, reproducible research with minimum
-    budget consumption enforced. The system will not allow early termination
-    until exploration requirements are met.
-    
-    Args:
-        task_prompt: The problem or question to solve
-        exploration_level: Enforcement preset - shallow/moderate/deep/exhaustive
-        constraints: List of hard constraints
-        custom_budget: Override default budget for this level (optional)
-        custom_target: Override default target score (optional)
-    
-    Exploration Levels:
-        shallow:    20 nodes,  80% min, 2 depths  (5 min, quick decisions)
-        moderate:   50 nodes,  85% min, 3 depths  (30 min, tech selection)
-        deep:       150 nodes, 90% min, 5 depths  (2 hrs, architecture)
-        exhaustive: 500 nodes, 95% min, 8 depths  (8 hrs, publication-grade)
-    
-    Returns:
-        Dictionary with run_id, enforcement config, and guidelines
-    
-    Example:
-        mcporter call tot-engine.tot_start_run_enforced
-            task_prompt="Design self-modelling architecture"
-            exploration_level="deep"
-            constraints=["Pi 4", "RLHF-free"]
-    """
-    # Get enforcement configuration
-    enf_config = get_enforcement_config(exploration_level)
-    
-    # Apply custom overrides if provided
-    if custom_budget:
-        enf_config.node_budget = custom_budget
-    if custom_target:
-        enf_config.target_score = custom_target
-    
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    run_id = str(uuid.uuid4())
-    
-    # Create search config from enforcement settings
-    config = SearchConfig(
-        beam_width=enf_config.beam_width,
-        n_generate=enf_config.n_generate,
-        max_depth=enf_config.max_depth,
-        node_budget=enf_config.node_budget,
-        target_score=enf_config.target_score,
-        exploration_level=exploration_level
-    )
-    
-    # Insert run with enforcement metadata
-    cursor.execute(
-        """INSERT INTO runs 
-           (run_id, task_prompt, constraints_json, search_config_json, status, 
-            created_at, is_enforced, enforcement_level)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (run_id, task_prompt, json.dumps(constraints), config.json(),
-         'active', datetime.now().isoformat(), True, exploration_level)
-    )
-    
-    # Create root node
-    root_id = str(uuid.uuid4())
-    cursor.execute(
-        """INSERT INTO nodes 
-           (node_id, run_id, parent_id, depth, thought, state_json, delta_json,
-            evaluation_json, score, status, state_hash, thought_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (root_id, run_id, None, 0, f"ROOT: {task_prompt[:100]}",
-         json.dumps({"constraints": constraints, "enforcement": exploration_level}),
-         json.dumps({}), json.dumps({"progress": 0.5, "feasibility": 0.5, "confidence": 0.5}),
-         0.5, 'active', 'root', hashlib.sha256(task_prompt.lower().encode()).hexdigest()[:16])
-    )
-    
-    conn.commit()
-    conn.close()
-    
-    # Get scoring guidelines
-    guideline = get_depth_guideline(0)
-    
-    return {
-        "success": True,
-        "run_id": run_id,
-        "root_node_id": root_id,
-        "mode": "enforced",
-        "exploration_level": exploration_level,
-        "config": {
-            "node_budget": enf_config.node_budget,
-            "min_required_nodes": enf_config.min_required_nodes,
-            "min_consumption_ratio": enf_config.min_consumption_ratio,
-            "beam_width": enf_config.beam_width,
-            "n_generate": enf_config.n_generate,
-            "max_depth": enf_config.max_depth,
-            "target_score": enf_config.target_score,
-        },
-        "scoring_guidelines": {
-            "depth_0": {
-                "range": guideline.score_range,
-                "strategy": guideline.strategy,
-                "example_scores": guideline.example_scores,
+    # Resolve parameters based on mode
+    if mode == "enforced":
+        if not exploration_level:
+            return {
+                "success": False,
+                "error": "exploration_level required when mode='enforced'",
+                "hint": "Use: exploration_level='shallow'|'moderate'|'deep'|'exhaustive'"
             }
-        },
-        "message": f"ENFORCED run started. MUST use {enf_config.min_required_nodes}+ nodes before synthesis."
-    }
-
-@mcp.tool()
-def tot_request_samples(run_id: str) -> Dict:
-    """
-    Request frontier nodes for expansion.
+        
+        # Get enforcement config
+        enf_config = get_enforcement_config(exploration_level)
+        
+        # Apply preset values
+        resolved_beam = custom_beam_width or enf_config.beam_width
+        resolved_n_gen = enf_config.n_generate
+        resolved_max_depth = enf_config.max_depth
+        resolved_budget = enf_config.node_budget
+        resolved_target = custom_target_score or enf_config.target_score
+        
+        mode_label = "enforced"
+        level_label = exploration_level
+        
+    else:  # regular mode
+        # Use provided values or defaults
+        resolved_beam = beam_width or DEFAULTS["beam_width"]
+        resolved_n_gen = n_generate or DEFAULTS["n_generate"]
+        resolved_max_depth = max_depth or DEFAULTS["max_depth"]
+        resolved_budget = node_budget or DEFAULTS["node_budget"]
+        resolved_target = target_score or DEFAULTS["target_score"]
+        
+        mode_label = "regular"
+        level_label = None
     
-    Returns the current frontier (best-scoring active nodes) that should be
-    expanded. Use this with both standard and enforced modes.
-    
-    Args:
-        run_id: The run ID from tot_start_run or tot_start_run_enforced
-    
-    Returns:
-        Dictionary with frontier nodes and sample requests
-    """
+    # Create run in database
     conn = db.get_connection()
     cursor = conn.cursor()
     
-    # Get config
-    cursor.execute("SELECT search_config_json, is_enforced, enforcement_level FROM runs WHERE run_id = ?", (run_id,))
-    run = cursor.fetchone()
-    if not run:
-        conn.close()
-        return {"success": False, "error": "Run not found"}
+    run_id = str(uuid.uuid4())
+    config = {
+        "beam_width": resolved_beam,
+        "n_generate": resolved_n_gen,
+        "max_depth": resolved_max_depth,
+        "node_budget": resolved_budget,
+        "target_score": resolved_target,
+        "mode": mode,
+        "exploration_level": level_label,
+    }
     
-    config = SearchConfig(**json.loads(run['search_config_json']))
-    is_enforced = run['is_enforced']
-    enf_level = run['enforcement_level']
-    
-    # Select frontier (top beam_width active nodes)
     cursor.execute(
-        """SELECT node_id, depth, thought, score, state_json 
-           FROM nodes 
-           WHERE run_id = ? AND status = 'active'
-           ORDER BY score DESC, depth ASC
-           LIMIT ?""",
-        (run_id, config.beam_width)
+        """INSERT INTO runs 
+           (run_id, task_prompt, constraints_json, search_config_json, 
+            status, created_at, mode, exploration_level)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, task_prompt, json.dumps(constraints), json.dumps(config),
+         'active', datetime.now().isoformat(), mode_label, level_label)
     )
-    frontier = [dict(row) for row in cursor.fetchall()]
+    
+    # Create root node
+    root_id = str(uuid.uuid4())
+    cursor.execute(
+        """INSERT INTO nodes 
+           (node_id, run_id, parent_id, depth, thought, state_json, delta_json,
+            evaluation_json, score, status, state_hash, thought_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (root_id, run_id, None, 0, f"ROOT: {task_prompt[:100]}",
+         json.dumps({"constraints": constraints, "mode": mode, "level": level_label}),
+         json.dumps({}), json.dumps({"progress": 0.5, "feasibility": 0.5}),
+         0.5, 'active', 'root', 
+         hashlib.sha256(task_prompt.lower().encode()).hexdigest()[:16])
+    )
+    
+    conn.commit()
     conn.close()
     
-    if not frontier:
-        return {"success": False, "error": "No frontier nodes to expand"}
-    
-    # Build sample requests
-    sample_requests = []
-    for node in frontier:
-        sample_requests.append({
-            "node_id": node["node_id"],
-            "depth": node["depth"],
-            "thought": node["thought"],
-            "score": node["score"],
-            "num_candidates": config.n_generate,
-        })
-    
+    # Build response
     response = {
         "success": True,
         "run_id": run_id,
-        "mode": "enforced" if is_enforced else "standard",
-        "frontier_size": len(frontier),
-        "sample_requests": sample_requests,
+        "root_node_id": root_id,
+        "mode": mode_label,
+        "config": config,
     }
     
-    # Add enforcement info if applicable
-    if is_enforced:
-        enf_config = get_enforcement_config(enf_level)
-        guideline = get_depth_guideline(frontier[0]["depth"] if frontier else 0)
+    # Add enforcement-specific info
+    if mode == "enforced":
+        enf_config = get_enforcement_config(exploration_level)
+        guideline = get_depth_guideline(0)
         
         response["enforcement"] = {
-            "level": enf_level,
+            "exploration_level": exploration_level,
             "min_required_nodes": enf_config.min_required_nodes,
-            "scoring_range": guideline.score_range,
-            "scoring_strategy": guideline.strategy,
+            "min_consumption_ratio": enf_config.min_consumption_ratio,
+            "message": f"MUST use {enf_config.min_required_nodes}+ nodes before synthesis",
+        }
+        response["scoring_guidelines"] = {
+            "depth_0": {
+                "range": guideline.score_range,
+                "strategy": guideline.strategy,
+            }
         }
     
     return response
 
+
 @mcp.tool()
-def tot_submit_samples(
-    run_id: str,
-    samples: List[Dict] = Field(..., description="List of {parent_node_id, candidates[]}")
-) -> Dict:
-    """
-    Submit generated thoughts for evaluation.
-    
-    Submit candidates for each frontier node. The engine will evaluate,
-    score, and insert valid candidates into the tree.
-    
-    Args:
-        run_id: The run ID
-        samples: List of samples, each with parent_node_id and candidates list
-    
-    Returns:
-        Dictionary with expansion results and statistics
-    """
+def tot_request_samples(run_id: str) -> Dict:
+    """Request frontier nodes for expansion"""
     conn = db.get_connection()
     cursor = conn.cursor()
     
-    # Get config
     cursor.execute("SELECT search_config_json FROM runs WHERE run_id = ?", (run_id,))
     run = cursor.fetchone()
     if not run:
         conn.close()
         return {"success": False, "error": "Run not found"}
     
-    config = SearchConfig(**json.loads(run['search_config_json']))
+    config = json.loads(run["search_config_json"])
+    
+    cursor.execute(
+        """SELECT node_id, depth, thought, score 
+           FROM nodes 
+           WHERE run_id = ? AND status = 'active'
+           ORDER BY score DESC, depth ASC
+           LIMIT ?""",
+        (run_id, config["beam_width"])
+    )
+    frontier = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    if not frontier:
+        return {"success": False, "error": "No frontier nodes"}
+    
+    response = {
+        "success": True,
+        "run_id": run_id,
+        "mode": config.get("mode", "regular"),
+        "frontier_size": len(frontier),
+        "sample_requests": [
+            {
+                "node_id": n["node_id"],
+                "depth": n["depth"],
+                "thought": n["thought"],
+                "score": n["score"],
+                "num_candidates": config["n_generate"],
+            }
+            for n in frontier
+        ],
+    }
+    
+    # Add enforcement info
+    if config.get("mode") == "enforced":
+        level = config.get("exploration_level")
+        if level:
+            from enforcement import get_enforcement_config
+            enf_config = get_enforcement_config(level)
+            guideline = get_depth_guideline(frontier[0]["depth"])
+            
+            response["enforcement"] = {
+                "level": level,
+                "min_required": enf_config.min_required_nodes,
+                "scoring_range": guideline.score_range,
+                "strategy": guideline.strategy,
+            }
+    
+    return response
+
+
+@mcp.tool()
+def tot_submit_samples(
+    run_id: str,
+    samples: List[Dict] = Field(..., description="List of {parent_node_id, candidates[]}")
+) -> Dict:
+    """Submit generated thoughts for evaluation"""
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT search_config_json FROM runs WHERE run_id = ?", (run_id,))
+    run = cursor.fetchone()
+    if not run:
+        conn.close()
+        return {"success": False, "error": "Run not found"}
+    
+    config = json.loads(run["search_config_json"])
+    mode = config.get("mode", "regular")
+    exploration_level = config.get("exploration_level")
     
     nodes_expanded = 0
     nodes_pruned = 0
     
     for sample in samples:
-        parent_id = sample["parent_node_id"]
-        candidates = sample["candidates"]
+        parent_id = sample.get("parent_node_id")
+        candidates = sample.get("candidates", [])
         
-        # Get parent info
-        cursor.execute(
-            "SELECT depth, state_json FROM nodes WHERE node_id = ?",
-            (parent_id,)
-        )
+        cursor.execute("SELECT depth FROM nodes WHERE node_id = ?", (parent_id,))
         parent = cursor.fetchone()
         if not parent:
             continue
         
         parent_depth = parent["depth"]
-        
-        # Check depth limit
-        if parent_depth >= config.max_depth:
+        if parent_depth >= config["max_depth"]:
             continue
         
         for cand_data in candidates:
             try:
-                # Validate candidate
-                cand = ThoughtCandidate(**cand_data)
-                
                 # Check budget
                 cursor.execute("SELECT COUNT(*) FROM nodes WHERE run_id = ?", (run_id,))
-                if cursor.fetchone()[0] >= config.node_budget:
+                if cursor.fetchone()[0] >= config["node_budget"]:
                     conn.commit()
                     conn.close()
                     return {
@@ -519,53 +384,40 @@ def tot_submit_samples(
                         "status": "stopped",
                         "stop_reason": "budget_exhausted",
                         "nodes_expanded": nodes_expanded,
-                        "nodes_pruned": nodes_pruned,
                     }
                 
-                # Calculate score
+                # Calculate score with mode-appropriate weights
+                cand = ThoughtCandidate(**cand_data)
                 score = calculate_score(
                     cand.progress_estimate,
                     cand.feasibility_estimate,
-                    0.7,  # default confidence
+                    0.7,
                     cand.risk_estimate,
-                    config.exploration_level or "moderate"
+                    exploration_level or "moderate"
                 )
                 
-                # Determine status
-                if score >= config.target_score:
-                    status = "terminal"
-                else:
-                    status = "active"
+                status = "terminal" if score >= config["target_score"] else "active"
                 
-                # Compute hashes
-                delta_json = json.dumps(cand.delta)
-                state_hash = hashlib.sha256(delta_json.encode()).hexdigest()[:16]
-                thought_hash = hashlib.sha256(cand.thought.lower().strip().encode()).hexdigest()[:16]
-                
-                # Insert node
                 node_id = str(uuid.uuid4())
+                delta_json = json.dumps(cand.delta)
                 cursor.execute(
                     """INSERT INTO nodes 
-                       (node_id, run_id, parent_id, depth, thought, state_json, delta_json,
+                       (node_id, run_id, parent_id, depth, thought, delta_json,
                         evaluation_json, score, status, state_hash, thought_hash)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (node_id, run_id, parent_id, parent_depth + 1,
-                     cand.thought,
-                     json.dumps({'parent_state': parent['state_json'], 'delta': cand.delta}),
-                     delta_json,
-                     json.dumps({
-                         "progress": cand.progress_estimate,
-                         "feasibility": cand.feasibility_estimate,
-                         "risk": cand.risk_estimate,
-                         "reasoning": cand.reasoning
-                     }),
-                     score, status, state_hash, thought_hash)
+                     cand.thought, delta_json,
+                     json.dumps({"progress": cand.progress_estimate, 
+                                "feasibility": cand.feasibility_estimate,
+                                "risk": cand.risk_estimate}),
+                     score, status,
+                     hashlib.sha256(delta_json.encode()).hexdigest()[:16],
+                     hashlib.sha256(cand.thought.lower().encode()).hexdigest()[:16])
                 )
                 nodes_expanded += 1
                 
-            except Exception as e:
+            except Exception:
                 nodes_pruned += 1
-                continue
     
     conn.commit()
     conn.close()
@@ -577,35 +429,33 @@ def tot_submit_samples(
         "status": "running",
     }
 
+
 @mcp.tool()
-def tot_get_best_path(run_id: str, enforce_completion: bool = Field(default=False)) -> Dict:
-    """
-    Get the best path and final synthesis.
-    
-    Args:
-        run_id: The run ID
-        enforce_completion: If True, rejects request if enforced run requirements not met
-    
-    Returns:
-        Dictionary with final answer and reasoning chain
-    """
+def tot_get_best_path(
+    run_id: str,
+    enforce_completion: bool = Field(default=False, description="For enforced mode: require min nodes")
+) -> Dict:
+    """Get best path and final synthesis"""
     conn = db.get_connection()
     cursor = conn.cursor()
     
-    # Get run info
     cursor.execute(
-        "SELECT is_enforced, enforcement_level, search_config_json FROM runs WHERE run_id = ?",
+        "SELECT mode, exploration_level, search_config_json FROM runs WHERE run_id = ?",
         (run_id,)
     )
     run = cursor.fetchone()
+    if not run:
+        conn.close()
+        return {"success": False, "error": "Run not found"}
     
-    is_enforced = run["is_enforced"] if run else False
-    enf_level = run["enforcement_level"] if run else None
-    config = SearchConfig(**json.loads(run["search_config_json"])) if run else None
+    mode = run["mode"]
+    level = run["exploration_level"]
+    config = json.loads(run["search_config_json"])
     
     # Check enforcement requirements
-    if enforce_completion and is_enforced:
-        enf_config = get_enforcement_config(enf_level)
+    if enforce_completion and mode == "enforced" and level:
+        from enforcement import get_enforcement_config
+        enf_config = get_enforcement_config(level)
         
         cursor.execute("SELECT COUNT(*) FROM nodes WHERE run_id = ?", (run_id,))
         node_count = cursor.fetchone()[0]
@@ -615,19 +465,16 @@ def tot_get_best_path(run_id: str, enforce_completion: bool = Field(default=Fals
             conn.close()
             return {
                 "success": False,
-                "error": f"Enforcement requirements not met",
+                "error": "Enforcement requirements not met",
                 "nodes_used": node_count,
                 "nodes_required": min_required,
-                "message": f"Must use {min_required}+ nodes before synthesis. Continue expanding.",
+                "message": f"Must use {min_required}+ nodes. Continue expanding.",
             }
     
-    # Find best terminal or highest-scoring node
+    # Find best node
     cursor.execute(
         """SELECT node_id, thought, score, depth 
-           FROM nodes 
-           WHERE run_id = ? 
-           ORDER BY score DESC, depth DESC
-           LIMIT 1""",
+           FROM nodes WHERE run_id = ? ORDER BY score DESC, depth DESC LIMIT 1""",
         (run_id,)
     )
     best = cursor.fetchone()
@@ -654,7 +501,6 @@ def tot_get_best_path(run_id: str, enforce_completion: bool = Field(default=Fals
             "score": node["score"],
         })
         current_id = node["parent_id"]
-    
     path.reverse()
     
     # Update run
@@ -670,106 +516,95 @@ def tot_get_best_path(run_id: str, enforce_completion: bool = Field(default=Fals
         "final_answer": best["thought"],
         "confidence": best["score"],
         "path_length": len(path),
-        "is_terminal": best["score"] >= (config.target_score if config else 0.85),
+        "mode": mode,
         "reasoning_chain": path,
-        "mode": "enforced" if is_enforced else "standard",
     }
+
 
 @mcp.tool()
 def tot_get_enforcement_status(run_id: str) -> Dict:
-    """
-    Get enforcement status for a run.
-    
-    Shows current progress against enforcement requirements.
-    Only useful for enforced runs (returns minimal info for standard runs).
-    
-    Args:
-        run_id: The run ID
-    
-    Returns:
-        Dictionary with enforcement metrics and recommendations
-    """
+    """Get enforcement status (useful for enforced runs)"""
     conn = db.get_connection()
     cursor = conn.cursor()
     
     cursor.execute(
-        "SELECT is_enforced, enforcement_level, search_config_json FROM runs WHERE run_id = ?",
+        "SELECT mode, exploration_level, search_config_json FROM runs WHERE run_id = ?",
         (run_id,)
     )
     run = cursor.fetchone()
-    
     if not run:
         conn.close()
         return {"success": False, "error": "Run not found"}
     
-    is_enforced = run["is_enforced"]
-    
-    if not is_enforced:
-        cursor.execute("SELECT COUNT(*) FROM nodes WHERE run_id = ?", (run_id,))
-        node_count = cursor.fetchone()[0]
-        conn.close()
-        return {
-            "success": True,
-            "mode": "standard",
-            "nodes_used": node_count,
-            "message": "Standard mode - no enforcement requirements",
-        }
-    
-    # Get enforcement stats
-    enf_level = run["enforcement_level"]
-    enf_config = get_enforcement_config(enf_level)
-    config = SearchConfig(**json.loads(run["search_config_json"]))
+    mode = run["mode"]
     
     cursor.execute("SELECT COUNT(*) FROM nodes WHERE run_id = ?", (run_id,))
     node_count = cursor.fetchone()[0]
     
+    if mode != "enforced":
+        conn.close()
+        return {
+            "success": True,
+            "mode": "regular",
+            "nodes_used": node_count,
+            "message": "Regular mode - no enforcement",
+        }
+    
+    level = run["exploration_level"]
+    from enforcement import get_enforcement_config
+    enf_config = get_enforcement_config(level)
+    
     cursor.execute("SELECT MAX(depth) FROM nodes WHERE run_id = ?", (run_id,))
     max_depth = cursor.fetchone()[0] or 0
-    
-    cursor.execute("SELECT AVG(score) FROM nodes WHERE run_id = ?", (run_id,))
-    avg_score = cursor.fetchone()[0] or 0
-    
-    conn.close()
     
     min_required = enf_config.min_required_nodes
     requirement_met = node_count >= min_required
     
+    conn.close()
+    
     return {
         "success": True,
         "mode": "enforced",
-        "exploration_level": enf_level,
+        "level": level,
         "progress": {
             "nodes_used": node_count,
             "nodes_required": min_required,
-            "nodes_remaining": max(0, min_required - node_count),
-            "budget_utilization": node_count / enf_config.node_budget,
             "requirement_met": requirement_met,
             "max_depth": max_depth,
-            "max_depth_required": 3 if enf_level in ["deep", "exhaustive"] else 2,
-            "avg_score": round(avg_score, 4),
         },
-        "config": {
-            "node_budget": enf_config.node_budget,
-            "target_score": enf_config.target_score,
-            "beam_width": enf_config.beam_width,
-        },
-        "recommendations": [] if requirement_met else [
-            f"Continue expansion: need {min_required - node_count} more nodes",
-            f"Current depth {max_depth}, target depth {enf_config.max_depth}",
-        ],
+        "message": "Requirements met" if requirement_met else f"Need {min_required - node_count} more nodes",
     }
+
+
+@mcp.tool()
+def tot_get_exploration_guide(level: str = Field(default="moderate", pattern="^(shallow|moderate|deep|exhaustive)$")) -> Dict:
+    """Get exploration guide for a level"""
+    config = DEPTH_CONFIGS[level]
+    guideline = get_depth_guideline(0)
+    
+    return {
+        "success": True,
+        "level": level,
+        "config": config,
+        "scoring": {
+            "range": guideline.score_range,
+            "strategy": guideline.strategy,
+            "example_scores": guideline.example_scores,
+        },
+        "use_when": config.get("use_when", []),
+        "avoid_when": config.get("avoid_when", []),
+    }
+
 
 @mcp.tool()
 def tot_list_runs(limit: int = Field(default=10, ge=1, le=100)) -> Dict:
-    """List recent ToT runs with their modes"""
+    """List recent runs"""
     conn = db.get_connection()
     cursor = conn.cursor()
     
     cursor.execute(
-        """SELECT run_id, task_prompt, status, created_at, is_enforced, enforcement_level
-           FROM runs 
-           ORDER BY created_at DESC 
-           LIMIT ?""",
+        """SELECT run_id, task_prompt, status, created_at, mode, exploration_level
+           FROM runs ORDER BY created_at DESC LIMIT ?""",
         (limit,)
     )
     runs = [dict(row) for row in cursor.fetchall()]
@@ -777,44 +612,6 @@ def tot_list_runs(limit: int = Field(default=10, ge=1, le=100)) -> Dict:
     
     return {"success": True, "runs": runs}
 
-@mcp.tool()
-def tot_get_exploration_guide(level: str = Field(default="moderate", pattern="^(shallow|moderate|deep|exhaustive)$")) -> Dict:
-    """
-    Get detailed exploration guide for a specific level.
-    
-    Returns scoring guidelines, when to use, and best practices.
-    
-    Args:
-        level: Exploration level (shallow/moderate/deep/exhaustive)
-    """
-    config = get_exploration_config(level)
-    
-    guidelines = []
-    for depth in range(0, min(config["max_depth"] + 1, 5)):
-        guideline = get_depth_guideline(depth)
-        guidelines.append({
-            "depth": depth,
-            "description": guideline.description,
-            "score_range": guideline.score_range,
-            "strategy": guideline.strategy,
-            "example_scores": guideline.example_scores,
-        })
-    
-    return {
-        "success": True,
-        "exploration_level": level,
-        "config": config,
-        "depth_guidelines": guidelines,
-        "candidate_strategies": get_candidate_strategies(level),
-        "best_practices": {
-            "do": config.get("use_when", []),
-            "avoid": config.get("avoid_when", []),
-        },
-    }
-
-# ============================================================================
-# Main
-# ============================================================================
 
 if __name__ == "__main__":
     mcp.run(transport='stdio')
